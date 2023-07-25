@@ -79,15 +79,13 @@ After tested locally, you can push the docker image to ECR
 
 ## Run the ML pipeline
 
-In order to train and run the ML pipeline in Sagemaker, go to Step Functions in AWS and start the execution. You can check progress of
-SageMaker also in the Training Jobs section of SageMaker. Once the SageMaker Endpoint is created you can 
-also check your SageMaker Endpoint. After running the State Machine in Step Functions successfully, you will see the
+In order to train and run the ML pipeline in Sagemaker, go to Step Functions in AWS and start the execution. You can check the training progress of in the Training Jobs section of SageMaker. Once the Step Functions completed successfully, you will see the
 SageMaker Endpoint being created in the AWS Console in the SageMaker Endpoints section. Make sure to 
 wait for the Status to change to “InService”.
 
 ## Test Sagemaker endpoint
 
-Use the following script to test the Sagemaker endpoint.Please replace the endpoint with the actual endpoint.
+Use the following script to test the Sagemaker endpoint.Please replace the endpoint with the actual SageMaker endpoint.
 ```shell script
 python src/container/local_test/test_enpoint.py
 ```
