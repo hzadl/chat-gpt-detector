@@ -1,0 +1,11 @@
+# required to serve the model
+flask==2.2.2
+gevent==22.10.2
+gunicorn==20.1.0
+
+
+# dependencies for the custom model
+transformers>=2.0.0
+tqdm>=4.32.2
+torch>=1.2.0
+tensorboard>=1.14.0

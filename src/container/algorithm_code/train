@@ -1,0 +1,317 @@
+#!/usr/bin/env python
+
+# A training component that trains a classifer to detect ChatGPT generated content.
+# This implementation works in File mode.
+# Input is specified as JSONL file, each item is required to have  "text" and "label" fields.
+
+from __future__ import print_function
+
+import os
+import json
+import sys
+import traceback
+from typing import List
+
+import torch
+
+from torch import nn
+import numpy as np
+
+from torch.optim import Adam
+from torch.utils.data import DataLoader, RandomSampler, Dataset
+from tqdm import tqdm
+
+# from transformers import *
+from transformers import (
+    GPT2ForSequenceClassification,
+    GPT2Tokenizer,
+    tokenization_utils,
+    PreTrainedTokenizer,
+)
+
+
+# These are the paths to where SageMaker mounts interesting things in your container.
+
+prefix = "/opt/ml/"
+
+input_path = prefix + "input/data"
+output_path = os.path.join(prefix, "output")
+model_path = os.path.join(prefix, "model")
+param_path = os.path.join(prefix, "input/config/hyperparameters.json")
+
+# This algorithm has a single channel of input data called 'training'. Since we run in
+# File mode, the input files are copied to the directory specified here.
+channel_name = "training"
+training_path = os.path.join(input_path, channel_name)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+class EncodedDataset(Dataset):
+    def __init__(
+        self,
+        data: List[dict],
+        tokenizer: PreTrainedTokenizer,
+        max_sequence_length: int = 128,
+        min_sequence_length: int = 10,
+        token_dropout: float = None,
+    ):
+        self.data = data
+        self.tokenizer = tokenizer
+        self.max_sequence_length = max_sequence_length
+        self.min_sequence_length = min_sequence_length
+        self.token_dropout = token_dropout
+        self.label_map = {"fake": 0, "real": 1}
+        self.random = np.random.RandomState()
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, index):
+        label = self.label_map[self.data[index]["label"]]
+        text = self.data[index]["text"]
+
+        tokens = self.tokenizer.encode(text)
+
+        # The following operation will add bos and eos to tokens, truncate or padding the token to the max_sequence_length
+        output_length = min(len(tokens), self.max_sequence_length)
+        if self.min_sequence_length:
+            output_length = self.random.randint(
+                min(self.min_sequence_length, len(tokens)), output_length + 1
+            )
+        start_index = (
+            0
+            if len(tokens) <= output_length
+            else self.random.randint(0, len(tokens) - output_length + 1)
+        )
+        end_index = start_index + output_length
+        tokens = tokens[start_index:end_index]
+
+        if self.token_dropout:
+            dropout_mask = self.random.binomial(
+                1, self.token_dropout, len(tokens)
+            ).astype(np.bool)
+            tokens = np.array(tokens)
+            tokens[dropout_mask] = self.tokenizer.unk_token_id
+            tokens = tokens.tolist()
+
+        if len(tokens) == self.max_sequence_length:
+            mask = torch.ones(len(tokens) + 2)
+            return (
+                torch.tensor(
+                    [self.tokenizer.bos_token_id]
+                    + tokens
+                    + [self.tokenizer.eos_token_id]
+                ),
+                mask,
+                label,
+            )
+
+        padding = [self.tokenizer.pad_token_id] * (
+            self.max_sequence_length - len(tokens)
+        )
+        tokens = torch.tensor(
+            [self.tokenizer.bos_token_id]
+            + tokens
+            + [self.tokenizer.eos_token_id]
+            + padding
+        )
+        mask = torch.ones(tokens.shape[0])
+        mask[-len(padding) :] = 0
+        return tokens, mask, label
+
+
+def read_jsonl_file(file_path):
+    data = []
+    with open(file_path, "r") as file:
+        for line in file:
+            try:
+                item = json.loads(line)
+                data.append(item)
+            except json.JSONDecodeError:
+                # Handle any invalid JSON lines, if needed
+                pass
+    return data
+
+
+def accuracy_sum(logits, labels):
+    if list(logits.shape) == list(labels.shape) + [2]:
+        # 2-d outputs
+        classification = (logits[..., 0] < logits[..., 1]).long().flatten()
+    else:
+        classification = (logits > 0).long().flatten()
+    assert classification.shape == labels.shape
+    return (classification == labels).float().sum().item()
+
+
+def train(model: nn.Module, optimizer, device: str, loader: DataLoader, desc="Train"):
+    model.train()
+
+    train_accuracy = 0
+    train_epoch_size = 0
+    train_loss = 0
+
+    with tqdm(loader, desc=desc, disable=False) as loop:
+        for texts, masks, labels in loop:
+            texts, masks, labels = texts.to(device), masks.to(device), labels.to(device)
+            batch_size = texts.shape[0]
+
+            optimizer.zero_grad()
+            loss, logits, _ = model(
+                texts, attention_mask=masks, labels=labels, return_dict=False
+            )
+            loss.backward()
+            optimizer.step()
+
+            batch_accuracy = accuracy_sum(logits, labels)
+            train_accuracy += batch_accuracy
+            train_epoch_size += batch_size
+            train_loss += loss.item() * batch_size
+
+            loop.set_postfix(loss=loss.item(), acc=train_accuracy / train_epoch_size)
+
+    return {
+        "train/accuracy": train_accuracy,
+        "train/epoch_size": train_epoch_size,
+        "train/loss": train_loss,
+    }
+
+
+def validate(model: nn.Module, device: str, loader: DataLoader, desc="Validation"):
+    model.eval()
+
+    validation_accuracy = 0
+    validation_epoch_size = 0
+    validation_loss = 0
+
+    with tqdm(loader, desc=desc, disable=False) as loop, torch.no_grad():
+        for texts, masks, labels in loop:
+            texts, masks, labels = (
+                texts.to(device),
+                masks.to(device),
+                labels.to(device),
+            )
+            batch_size = texts.shape[0]
+
+            loss, logits, _ = model(
+                texts, attention_mask=masks, labels=labels, return_dict=False
+            )
+
+            batch_accuracy = accuracy_sum(logits, labels)
+            validation_accuracy += batch_accuracy
+            validation_epoch_size += batch_size
+            validation_loss += loss.item() * batch_size
+
+            loop.set_postfix(
+                loss=loss.item(), acc=validation_accuracy / validation_epoch_size
+            )
+
+    return {
+        "validation/accuracy": validation_accuracy,
+        "validation/epoch_size": validation_epoch_size,
+        "validation/loss": validation_loss,
+    }
+
+
+# The function to execute the training.
+def run():
+    print("Starting the training.")
+    try:
+        # Read in any hyperparameters that the user passed with the training job, not used in this training job
+        with open(param_path, "r") as tc:
+            trainingParams = json.load(tc)
+
+        batch_size = 24
+        learning_rate = 1e-5
+        weight_decay = 0
+        max_epochs = 1
+        Sampler = RandomSampler
+
+        # Init Model and tokenizer
+        model_name = "gpt2"
+        tokenization_utils.logger.setLevel("ERROR")
+        tokenizer = GPT2Tokenizer.from_pretrained(model_name, add_special_tokens=True)
+        tokenizer.pad_token = tokenizer.eos_token
+        model = GPT2ForSequenceClassification.from_pretrained(model_name).to(device)
+        model.config.pad_token_id = model.config.eos_token_id
+
+        # Load train.jsonl and val.jsonl into List[dict]
+        train_data_path = os.path.join(training_path, "train.jsonl")
+        val_data_path = os.path.join(training_path, "val.jsonl")
+        train_data = read_jsonl_file(train_data_path)
+        val_data = read_jsonl_file(val_data_path)
+
+        # Create dataset using the train_data and val_data
+        train_dataset = EncodedDataset(data=train_data, tokenizer=tokenizer)
+        val_dataset = EncodedDataset(data=val_data, tokenizer=tokenizer)
+
+        train_loader = DataLoader(
+            dataset=train_dataset, batch_size=batch_size, sampler=Sampler(train_dataset)
+        )
+
+        val_loader = DataLoader(
+            dataset=val_dataset, batch_size=batch_size, sampler=Sampler(val_dataset)
+        )
+
+        optimizer = Adam(
+            model.parameters(), lr=learning_rate, weight_decay=weight_decay
+        )
+
+        logdir = "logs"
+        os.makedirs(logdir, exist_ok=True)
+
+        from torch.utils.tensorboard import SummaryWriter
+
+        writer = SummaryWriter(logdir)
+        best_validation_accuracy = 0
+
+        for epoch in range(max_epochs):
+            train_metrics = train(
+                model, optimizer, device, train_loader, f"Epoch {epoch}"
+            )
+            validation_metrics = validate(model, device, val_loader)
+
+            combined_metrics = {**validation_metrics, **train_metrics}
+
+            combined_metrics["train/accuracy"] /= combined_metrics["train/epoch_size"]
+            combined_metrics["train/loss"] /= combined_metrics["train/epoch_size"]
+            combined_metrics["validation/accuracy"] /= combined_metrics[
+                "validation/epoch_size"
+            ]
+            combined_metrics["validation/loss"] /= combined_metrics[
+                "validation/epoch_size"
+            ]
+
+            for key, value in combined_metrics.items():
+                writer.add_scalar(key, value, global_step=epoch)
+
+            if combined_metrics["validation/accuracy"] > best_validation_accuracy:
+                best_validation_accuracy = combined_metrics["validation/accuracy"]
+
+                model_to_save = model.module if hasattr(model, "module") else model
+                torch.save(
+                    dict(
+                        epoch=epoch,
+                        model_state_dict=model_to_save.state_dict(),
+                        optimizer_state_dict=optimizer.state_dict(),
+                    ),
+                    os.path.join(model_path, "best-model.pt"),
+                )
+        print("Training complete.")
+    except Exception as e:
+        # Write out an error file. This will be returned as the failureReason in the
+        # DescribeTrainingJob result.
+        trc = traceback.format_exc()
+        with open(os.path.join(output_path, "failure"), "w") as s:
+            s.write("Exception during training: " + str(e) + "\n" + trc)
+        # Printing this causes the exception to be in the training job logs, as well.
+        print("Exception during training: " + str(e) + "\n" + trc, file=sys.stderr)
+        # A non-zero exit code causes the training job to be marked as Failed.
+        sys.exit(255)
+
+
+if __name__ == "__main__":
+    run()
+
+    # A zero exit code causes the job to be marked a Succeeded.
+    sys.exit(0)
